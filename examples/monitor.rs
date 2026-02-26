@@ -1,4 +1,4 @@
-use lennox_s30::S30Client;
+use lennox_s30::{MessageLogMode, S30Client};
 use std::env;
 use std::time::Duration;
 
@@ -7,8 +7,18 @@ async fn main() -> lennox_s30::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = env::args().collect();
-    let ip = args.get(1).expect("usage: monitor <ip> [--http]");
+    let ip = args
+        .get(1)
+        .expect("usage: monitor <ip> [--http] [--log <path>] [--log-diff <path>]");
     let use_http = args.iter().any(|a| a == "--http");
+    let log_full = args
+        .iter()
+        .position(|a| a == "--log")
+        .and_then(|i| args.get(i + 1));
+    let log_diff = args
+        .iter()
+        .position(|a| a == "--log-diff")
+        .and_then(|i| args.get(i + 1));
 
     let mut builder = S30Client::builder(ip)
         .on_event(|event| {
@@ -39,6 +49,13 @@ async fn main() -> lennox_s30::Result<()> {
 
     if use_http {
         builder = builder.protocol("http");
+    }
+    if let Some(path) = log_full {
+        println!("Logging messages (full) to {path}");
+        builder = builder.message_log(MessageLogMode::Full, path);
+    } else if let Some(path) = log_diff {
+        println!("Logging messages (diffed) to {path}");
+        builder = builder.message_log(MessageLogMode::Diffed, path);
     }
 
     let mut client = builder.build();
