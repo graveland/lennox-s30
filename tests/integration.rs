@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use lennox_s30::{Event, S30Client};
 
 /// Run with: cargo test --test integration -- --ignored
-/// Requires: cd ~/home/lennoxs30api && python simulator/main.py -c simulator/conf/config_heatpump_furnace.json
+/// Requires simulator running:
+///   cd ~/home/lennoxs30api && .venv/bin/python -m aiohttp.web simulator.main:init_func \
+///     -c simulator/conf/config_heatpump_furnace.json --port 8080
 #[tokio::test]
 #[ignore]
 async fn connect_poll_disconnect() {
@@ -19,8 +21,17 @@ async fn connect_poll_disconnect() {
 
     client.connect().await.expect("connect failed");
 
-    // First poll should return system config + zone data
-    client.poll().await.expect("poll failed");
+    // Simulator queues multiple messages (config, equipment, devices, etc.)
+    // and returns one per poll via queue.pop() (LIFO). Poll until system data arrives.
+    for i in 0..10 {
+        client
+            .poll()
+            .await
+            .unwrap_or_else(|e| panic!("poll {i} failed: {e}"));
+        if !client.systems().is_empty() && !client.systems()[0].zones.is_empty() {
+            break;
+        }
+    }
 
     let systems = client.systems();
     assert!(!systems.is_empty(), "should have at least one system");
@@ -40,8 +51,8 @@ async fn connect_poll_disconnect() {
 #[tokio::test]
 #[ignore]
 async fn outdoor_temp_updates() {
-    // Simulator cycles outdoor temp every 5s. Poll twice with a delay
-    // and verify OutdoorTempChanged fires.
+    // Requires outdoorTempSim: true in simulator config.
+    // Cycles outdoor temp every 5s. Drain initial queue, wait for sim, then poll.
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let events_clone = events.clone();
 
@@ -54,14 +65,22 @@ async fn outdoor_temp_updates() {
 
     client.connect().await.expect("connect failed");
 
-    // First poll - initial state
-    client.poll().await.expect("first poll failed");
+    // Drain the initial config queue
+    for i in 0..10 {
+        client
+            .poll()
+            .await
+            .unwrap_or_else(|e| panic!("drain poll {i} failed: {e}"));
+        if !client.systems().is_empty() {
+            break;
+        }
+    }
 
-    // Wait for simulator to cycle
+    // Wait for simulator to cycle outdoor temp
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    // Second poll - should see changes
-    client.poll().await.expect("second poll failed");
+    // Poll for the temp update
+    client.poll().await.expect("temp poll failed");
 
     {
         let captured = events.lock().unwrap();
