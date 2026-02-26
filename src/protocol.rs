@@ -42,7 +42,6 @@ pub fn away_schedule_id(zone_id: u8) -> u32 {
     24 + zone_id as u32
 }
 
-#[allow(dead_code)]
 pub fn override_schedule_id(zone_id: u8) -> u32 {
     32 + zone_id as u32
 }
@@ -103,6 +102,27 @@ pub fn set_fan_mode_data(schedule_id: u32, mode: &str) -> Value {
                 }]
             },
             "id": schedule_id
+        }]
+    })
+}
+
+pub fn set_manual_away_data(away: bool) -> Value {
+    json!({"occupancy": {"manualAway": away}})
+}
+
+pub fn set_schedule_hold_data(zone_id: u8, hold: bool) -> Value {
+    json!({
+        "zones": [{
+            "config": {
+                "scheduleHold": {
+                    "scheduleId": override_schedule_id(zone_id),
+                    "exceptionType": "hold",
+                    "enabled": hold,
+                    "expiresOn": "0",
+                    "expirationMode": "nextPeriod"
+                }
+            },
+            "id": zone_id
         }]
     })
 }
@@ -173,6 +193,33 @@ mod tests {
         let data = parse_retrieve_response(body);
         assert_eq!(data.len(), 1);
         assert!(data[0].get("system").is_some());
+    }
+
+    #[test]
+    fn set_manual_away_data_structure() {
+        let data = set_manual_away_data(true);
+        assert_eq!(data["occupancy"]["manualAway"], true);
+
+        let data = set_manual_away_data(false);
+        assert_eq!(data["occupancy"]["manualAway"], false);
+    }
+
+    #[test]
+    fn set_schedule_hold_data_structure() {
+        let data = set_schedule_hold_data(0, true);
+        let zone = &data["zones"][0];
+        assert_eq!(zone["id"], 0);
+        assert_eq!(zone["config"]["scheduleHold"]["scheduleId"], 32);
+        assert_eq!(zone["config"]["scheduleHold"]["exceptionType"], "hold");
+        assert_eq!(zone["config"]["scheduleHold"]["enabled"], true);
+        assert_eq!(zone["config"]["scheduleHold"]["expiresOn"], "0");
+        assert_eq!(zone["config"]["scheduleHold"]["expirationMode"], "nextPeriod");
+
+        let data = set_schedule_hold_data(1, false);
+        let zone = &data["zones"][0];
+        assert_eq!(zone["id"], 1);
+        assert_eq!(zone["config"]["scheduleHold"]["scheduleId"], 33);
+        assert_eq!(zone["config"]["scheduleHold"]["enabled"], false);
     }
 
     #[test]

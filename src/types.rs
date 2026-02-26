@@ -136,6 +136,7 @@ pub struct Zone {
     pub operating: OperatingState,
     pub aux_heat: bool,
     pub schedule_id: Option<u32>,
+    pub override_active: bool,
 }
 
 impl Zone {
@@ -155,12 +156,21 @@ pub struct System {
     pub temperature_unit: String,
     pub indoor_unit_type: String,
     pub outdoor_unit_type: String,
+    pub manual_away: bool,
+    pub smart_away_enabled: bool,
+    pub smart_away_setpoint_state: String,
 }
 
 impl System {
     /// Iterate over zones that have received status data.
     pub fn active_zones(&self) -> impl Iterator<Item = &Zone> {
         self.zones.iter().filter(|z| z.has_data())
+    }
+
+    pub fn is_away(&self) -> bool {
+        self.manual_away
+            || (self.smart_away_enabled
+                && matches!(self.smart_away_setpoint_state.as_str(), "transition" | "away"))
     }
 }
 
@@ -174,6 +184,8 @@ pub enum Event {
     ZoneSetpointsChanged { zone_id: u8, name: String, heat: Option<Temperature>, cool: Option<Temperature> },
     ZoneFanChanged { zone_id: u8, name: String, mode: FanMode, running: bool },
     OutdoorTempChanged { temp: Temperature },
+    AwayModeChanged { away: bool },
+    ZoneHoldChanged { zone_id: u8, name: String, active: bool },
 
     SystemTemperature { path: String, temp: Temperature },
     SystemNumeric { path: String, value: f64 },

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use lennox_s30::S30Client;
-use wiremock::matchers::{method, path_regex};
+use lennox_s30::{Event, S30Client};
+use wiremock::matchers::{body_string_contains, method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn setup_connect_mocks() -> Vec<Mock> {
@@ -338,4 +338,218 @@ async fn disconnect_sets_not_connected() {
 
     let err = client.poll().await.unwrap_err();
     assert!(matches!(err, lennox_s30::Error::NotConnected));
+}
+
+async fn client_with_zone(server: &MockServer) -> S30Client {
+    let zone_body = serde_json::json!({
+        "messages": [{
+            "SenderID": "LCC",
+            "Data": {
+                "zones": [{
+                    "id": 0,
+                    "name": "Upstairs",
+                    "status": {
+                        "temperature": 71, "temperatureC": 21.5,
+                        "period": {
+                            "systemMode": "heat",
+                            "hsp": 70, "hspC": 21.0,
+                            "csp": 76, "cspC": 24.5,
+                            "fanMode": "auto"
+                        }
+                    },
+                    "config": { "scheduleId": 16 }
+                }]
+            }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&zone_body))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+
+    let mut client = connected_client(server).await;
+    client.poll().await.unwrap();
+    client
+}
+
+#[tokio::test]
+async fn set_away_sends_correct_payload() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/Messages/Publish"))
+        .and(body_string_contains("manualAway"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut client = connected_client(&server).await;
+    client.set_away(true).await.expect("set_away should succeed");
+}
+
+#[tokio::test]
+async fn poll_occupancy_fires_away_event() {
+    let server = MockServer::start().await;
+    let poll_body = serde_json::json!({
+        "messages": [{
+            "SenderID": "LCC",
+            "Data": {
+                "occupancy": {
+                    "manualAway": true,
+                    "smartAway": {
+                        "enabled": false,
+                        "setpointState": "home"
+                    }
+                }
+            }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .mount(&server)
+        .await;
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
+    let events_clone = events.clone();
+
+    let addr = server.address();
+    for mock in setup_connect_mocks() {
+        mock.mount(&server).await;
+    }
+    let mut client = S30Client::builder(format!("{}:{}", addr.ip(), addr.port()))
+        .protocol("http")
+        .on_event(move |event| {
+            events_clone.lock().unwrap().push(event.clone());
+        })
+        .build();
+
+    client.connect().await.unwrap();
+    client.poll().await.unwrap();
+
+    let captured = events.lock().unwrap();
+    let has_away = captured.iter().any(|e| matches!(e, Event::AwayModeChanged { away: true }));
+    assert!(has_away, "should fire AwayModeChanged {{ away: true }}");
+
+    let system = &client.systems()[0];
+    assert!(system.manual_away);
+    assert!(system.is_away());
+}
+
+#[tokio::test]
+async fn set_schedule_hold_sends_correct_payload() {
+    let server = MockServer::start().await;
+
+    // Publish mock for the hold command
+    Mock::given(method("POST"))
+        .and(path_regex(r"/Messages/Publish"))
+        .and(body_string_contains("scheduleHold"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut client = client_with_zone(&server).await;
+    client
+        .set_schedule_hold(0, true)
+        .await
+        .expect("set_schedule_hold should succeed");
+}
+
+#[tokio::test]
+async fn set_schedule_hold_invalid_zone() {
+    let server = MockServer::start().await;
+    let mut client = connected_client(&server).await;
+    let err = client.set_schedule_hold(99, true).await.unwrap_err();
+    assert!(matches!(err, lennox_s30::Error::InvalidZone(99)));
+}
+
+#[tokio::test]
+async fn poll_schedule_hold_fires_event() {
+    let server = MockServer::start().await;
+    let poll_body = serde_json::json!({
+        "messages": [{
+            "SenderID": "LCC",
+            "Data": {
+                "zones": [{
+                    "id": 0,
+                    "name": "Upstairs",
+                    "config": {
+                        "scheduleHold": {
+                            "scheduleId": 32,
+                            "enabled": true
+                        }
+                    }
+                }]
+            }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .mount(&server)
+        .await;
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
+    let events_clone = events.clone();
+
+    let addr = server.address();
+    for mock in setup_connect_mocks() {
+        mock.mount(&server).await;
+    }
+    let mut client = S30Client::builder(format!("{}:{}", addr.ip(), addr.port()))
+        .protocol("http")
+        .on_event(move |event| {
+            events_clone.lock().unwrap().push(event.clone());
+        })
+        .build();
+
+    client.connect().await.unwrap();
+    client.poll().await.unwrap();
+
+    let captured = events.lock().unwrap();
+    let has_hold = captured.iter().any(|e| {
+        matches!(e, Event::ZoneHoldChanged { zone_id: 0, active: true, .. })
+    });
+    assert!(has_hold, "should fire ZoneHoldChanged {{ active: true }}");
+
+    let zone = client.zone(0, 0).unwrap();
+    assert!(zone.override_active);
+}
+
+#[tokio::test]
+async fn set_setpoints_valid_gap() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/Messages/Publish"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let mut client = client_with_zone(&server).await;
+    // 65°F heat, 75°F cool — plenty of gap
+    let heat = lennox_s30::Temperature::from_fahrenheit(65.0);
+    let cool = lennox_s30::Temperature::from_fahrenheit(75.0);
+    client
+        .set_setpoints(0, heat, cool)
+        .await
+        .expect("should succeed with valid gap");
+}
+
+#[tokio::test]
+async fn set_setpoints_insufficient_gap() {
+    let server = MockServer::start().await;
+    let mut client = client_with_zone(&server).await;
+
+    // 72°F heat, 73°F cool — only ~0.5°C gap, less than 1.5°C deadband
+    let heat = lennox_s30::Temperature::from_fahrenheit(72.0);
+    let cool = lennox_s30::Temperature::from_fahrenheit(73.0);
+    let err = client.set_setpoints(0, heat, cool).await.unwrap_err();
+    assert!(
+        matches!(err, lennox_s30::Error::InvalidSetpoints { .. }),
+        "expected InvalidSetpoints, got {err:?}"
+    );
 }

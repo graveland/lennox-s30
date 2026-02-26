@@ -3,7 +3,10 @@ use tracing::{debug, trace};
 
 use crate::diff::{diff_json, generic_event, map_typed_event, Scope};
 use crate::logger::{MessageLogMode, MessageLogger};
-use crate::protocol::{manual_schedule_id, parse_retrieve_response, subscribe_message, DEFAULT_APP_ID};
+use crate::protocol::{
+    manual_schedule_id, override_schedule_id, parse_retrieve_response, subscribe_message,
+    DEFAULT_APP_ID,
+};
 use crate::types::*;
 use crate::{Error, Result};
 
@@ -245,6 +248,38 @@ impl S30Client {
             );
         }
 
+        if let Some(occ) = data.get("occupancy") {
+            let sys_idx = self.ensure_system("0");
+            let system = &mut self.systems[sys_idx];
+            let prev_away = system.is_away();
+
+            if let Some(away) = occ.get("manualAway").and_then(|v| v.as_bool()) {
+                system.manual_away = away;
+            }
+            if let Some(sa) = occ.pointer("/smartAway") {
+                if let Some(enabled) = sa.get("enabled").and_then(|v| v.as_bool()) {
+                    system.smart_away_enabled = enabled;
+                }
+                if let Some(state) = sa.get("setpointState").and_then(|v| v.as_str()) {
+                    system.smart_away_setpoint_state = state.to_string();
+                }
+            }
+
+            let new_away = system.is_away();
+            if new_away != prev_away {
+                all_events.push(Event::AwayModeChanged { away: new_away });
+            }
+            snapshot_system_indices.insert(sys_idx);
+
+            merge_json(
+                self.previous_json
+                    .as_object_mut()
+                    .expect("previous_json is always an object"),
+                "occupancy",
+                occ,
+            );
+        }
+
         if let Some(Value::Array(zones_arr)) = data.get("zones") {
             for zone_data in zones_arr {
                 let zone_id = match zone_data.get("id").and_then(|v| v.as_u64()) {
@@ -289,7 +324,27 @@ impl S30Client {
                     }
                 }
 
+                let prev_override = self.systems[sys_idx]
+                    .zones
+                    .iter()
+                    .find(|z| z.id == zone_id)
+                    .map(|z| z.override_active);
+
                 self.update_zone_from_json(sys_idx, zone_id, zone_data);
+
+                let zone_ref = self.systems[sys_idx]
+                    .zones
+                    .iter()
+                    .find(|z| z.id == zone_id)
+                    .unwrap();
+                if Some(zone_ref.override_active) != prev_override {
+                    all_events.push(Event::ZoneHoldChanged {
+                        zone_id,
+                        name: zone_name.clone(),
+                        active: zone_ref.override_active,
+                    });
+                }
+
                 snapshot_system_indices.insert(sys_idx);
 
                 let zones_map = self
@@ -495,6 +550,12 @@ impl S30Client {
         if let Some(sched_id) = data.pointer("/config/scheduleId").and_then(|v| v.as_u64()) {
             zone.schedule_id = Some(sched_id as u32);
         }
+
+        if let Some(hold) = data.pointer("/config/scheduleHold") {
+            let hold_sched = hold.get("scheduleId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let enabled = hold.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            zone.override_active = hold_sched == override_schedule_id(zone_id) && enabled;
+        }
     }
 
     // -- Command methods --
@@ -565,6 +626,50 @@ impl S30Client {
         self.ensure_manual_schedule(zone_id).await?;
         let data = crate::protocol::set_setpoint_data(manual_id, hsp_f, hsp_c, csp_f, csp_c);
         self.publish_command_logged("set_cool_setpoint", Some(zone_id), data)
+            .await
+    }
+
+    /// Set system-wide away mode (occupancy override).
+    pub async fn set_away(&mut self, away: bool) -> Result<()> {
+        let data = crate::protocol::set_manual_away_data(away);
+        self.publish_command_logged("set_away", None, data).await
+    }
+
+    /// Set schedule hold for a zone (temporary override of current schedule period).
+    pub async fn set_schedule_hold(&mut self, zone_id: u8, hold: bool) -> Result<()> {
+        self.find_zone(zone_id)?;
+        let data = crate::protocol::set_schedule_hold_data(zone_id, hold);
+        self.publish_command_logged("set_schedule_hold", Some(zone_id), data)
+            .await
+    }
+
+    /// Set both heat and cool setpoints atomically. Rejects deadband violations.
+    pub async fn set_setpoints(
+        &mut self,
+        zone_id: u8,
+        heat: Temperature,
+        cool: Temperature,
+    ) -> Result<()> {
+        let hsp_c = heat.to_lennox_celsius();
+        let csp_c = cool.to_lennox_celsius();
+        if csp_c < hsp_c + DEADBAND_C {
+            return Err(Error::InvalidSetpoints {
+                heat_c: hsp_c,
+                cool_c: csp_c,
+                deadband_c: DEADBAND_C,
+            });
+        }
+        self.find_zone(zone_id)?;
+        self.ensure_manual_schedule(zone_id).await?;
+        let manual_id = manual_schedule_id(zone_id);
+        let data = crate::protocol::set_setpoint_data(
+            manual_id,
+            heat.to_lennox_fahrenheit(),
+            hsp_c,
+            cool.to_lennox_fahrenheit(),
+            csp_c,
+        );
+        self.publish_command_logged("set_setpoints", Some(zone_id), data)
             .await
     }
 
