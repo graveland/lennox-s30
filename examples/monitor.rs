@@ -29,7 +29,7 @@ async fn main() -> lennox_s30::Result<()> {
             println!("{event:?}");
         })
         .on_snapshot(|system| {
-            for zone in &system.zones {
+            for zone in system.active_zones() {
                 if let Some(temp) = zone.temperature {
                     println!(
                         "[{}] {:.1}\u{00b0}C / {:.1}\u{00b0}F | mode: {:?} | fan: {:?}{}",

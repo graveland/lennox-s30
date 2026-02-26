@@ -138,6 +138,13 @@ pub struct Zone {
     pub schedule_id: Option<u32>,
 }
 
+impl Zone {
+    /// True if this zone has received at least one status update with readings.
+    pub fn has_data(&self) -> bool {
+        self.temperature.is_some() || self.humidity.is_some() || self.mode.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct System {
     pub id: String,
@@ -148,6 +155,13 @@ pub struct System {
     pub temperature_unit: String,
     pub indoor_unit_type: String,
     pub outdoor_unit_type: String,
+}
+
+impl System {
+    /// Iterate over zones that have received status data.
+    pub fn active_zones(&self) -> impl Iterator<Item = &Zone> {
+        self.zones.iter().filter(|z| z.has_data())
+    }
 }
 
 /// Events emitted by the diff engine when state changes.
