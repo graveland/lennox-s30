@@ -1,24 +1,7 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-const APP_ID_PREFIX: &str = "mapp0";
-const APP_ID_LEN: usize = 26;
-
-/// Generate a unique app ID in Lennox's expected format.
-/// Uses hex-encoded timestamp + random suffix, matching the Python library's approach.
-pub fn generate_app_id() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let hex = format!("{now:x}");
-    let suffix_len = APP_ID_LEN - APP_ID_PREFIX.len();
-    if hex.len() >= suffix_len {
-        format!("{APP_ID_PREFIX}{}", &hex[..suffix_len])
-    } else {
-        format!("{APP_ID_PREFIX}{hex:0>suffix_len$}")
-    }
-}
+pub const DEFAULT_APP_ID: &str = "lennox_s30";
 
 const LAN_SUBSCRIBE_PATHS: &str = "1;\
     /zones;/occupancy;/schedules;/system;/equipments;\
@@ -148,13 +131,6 @@ pub fn parse_retrieve_response(body: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn app_id_format() {
-        let id = generate_app_id();
-        assert_eq!(id.len(), APP_ID_LEN);
-        assert!(id.starts_with(APP_ID_PREFIX));
-    }
 
     #[test]
     fn subscribe_message_structure() {

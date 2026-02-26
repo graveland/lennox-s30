@@ -3,9 +3,7 @@ use tracing::{debug, trace};
 
 use crate::diff::{diff_json, generic_event, map_typed_event, Scope};
 use crate::logger::{MessageLogMode, MessageLogger};
-use crate::protocol::{
-    generate_app_id, manual_schedule_id, parse_retrieve_response, subscribe_message,
-};
+use crate::protocol::{manual_schedule_id, parse_retrieve_response, subscribe_message, DEFAULT_APP_ID};
 use crate::types::*;
 use crate::{Error, Result};
 
@@ -17,6 +15,7 @@ type SnapshotCallback = Box<dyn Fn(&System) + Send + Sync>;
 pub struct S30ClientBuilder {
     ip: String,
     protocol: String,
+    app_id: Option<String>,
     event_callbacks: Vec<EventCallback>,
     snapshot_callbacks: Vec<SnapshotCallback>,
     log_mode: Option<MessageLogMode>,
@@ -28,6 +27,7 @@ impl S30ClientBuilder {
         Self {
             ip: ip.into(),
             protocol: "https".to_string(),
+            app_id: None,
             event_callbacks: Vec::new(),
             snapshot_callbacks: Vec::new(),
             log_mode: None,
@@ -37,6 +37,11 @@ impl S30ClientBuilder {
 
     pub fn protocol(mut self, proto: &str) -> Self {
         self.protocol = proto.to_string();
+        self
+    }
+
+    pub fn app_id(mut self, id: impl Into<String>) -> Self {
+        self.app_id = Some(id.into());
         self
     }
 
@@ -72,7 +77,7 @@ impl S30ClientBuilder {
         S30Client {
             http,
             base_url: format!("{}://{}", self.protocol, self.ip),
-            app_id: generate_app_id(),
+            app_id: self.app_id.unwrap_or_else(|| DEFAULT_APP_ID.to_string()),
             connected: false,
             systems: Vec::new(),
             previous_json: Value::Object(Map::new()),

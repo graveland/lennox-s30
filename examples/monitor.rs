@@ -9,8 +9,12 @@ async fn main() -> lennox_s30::Result<()> {
     let args: Vec<String> = env::args().collect();
     let ip = args
         .get(1)
-        .expect("usage: monitor <ip> [--http] [--log <path>] [--log-diff <path>]");
+        .expect("usage: monitor <ip> [--app-id <id>] [--http] [--log <path>] [--log-diff <path>]");
     let use_http = args.iter().any(|a| a == "--http");
+    let app_id = args
+        .iter()
+        .position(|a| a == "--app-id")
+        .and_then(|i| args.get(i + 1));
     let log_full = args
         .iter()
         .position(|a| a == "--log")
@@ -49,6 +53,9 @@ async fn main() -> lennox_s30::Result<()> {
 
     if use_http {
         builder = builder.protocol("http");
+    }
+    if let Some(id) = app_id {
+        builder = builder.app_id(id);
     }
     if let Some(path) = log_full {
         println!("Logging messages (full) to {path}");
