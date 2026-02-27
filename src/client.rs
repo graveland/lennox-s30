@@ -947,6 +947,11 @@ impl S30Client {
         self.publish_command_logged("set_parameter", None, data).await
     }
 
+    pub async fn set_diag_level(&mut self, level: u8) -> Result<()> {
+        let data = crate::protocol::set_diag_level_data(level);
+        self.publish_command_logged("set_diag_level", None, data).await
+    }
+
     // -- Helpers --
 
     fn find_zone(&self, zone_id: u8) -> Result<&Zone> {
