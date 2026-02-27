@@ -71,6 +71,27 @@ async fn main() -> lennox_s30::Result<()> {
         system.is_away(),
         system.manual_away
     );
+
+    if let Some(outdoor) = system.outdoor_unit() {
+        println!("\n=== Outdoor Unit (equip_type={}) ===", outdoor.equip_type);
+        if let Some(bp) = outdoor.high_balance_point() {
+            println!("  High balance point: {bp}°F");
+        }
+        if let Some(bp) = outdoor.low_balance_point() {
+            println!("  Low balance point: {bp}°F");
+        }
+        if let Some(enabled) = outdoor.balance_point_enabled() {
+            println!("  Balance point control: {enabled}");
+        }
+        if let Some(aux) = outdoor.aux_heat_activation_threshold() {
+            println!("  Aux heat threshold: {aux}°F");
+        }
+        println!("  Parameters: {} total", outdoor.parameters.len());
+    }
+    println!(
+        "  HP lockout: {} | Aux lockout: {}",
+        system.hp_low_ambient_lockout, system.aux_heat_high_ambient_lockout
+    );
     println!();
 
     let orig_heat = zone.heat_setpoint;

@@ -127,6 +127,22 @@ pub fn set_schedule_hold_data(zone_id: u8, hold: bool) -> Value {
     })
 }
 
+pub fn set_diag_level_data(level: u8) -> Value {
+    json!({"systemControl": {"diagControl": {"level": level}}})
+}
+
+pub fn set_parameter_data(equip_type: u16, pid: u16, value: &str) -> Value {
+    json!({
+        "systemControl": {
+            "parameterUpdate": {
+                "et": equip_type,
+                "pid": pid,
+                "value": value
+            }
+        }
+    })
+}
+
 pub fn parse_retrieve_response(body: &str) -> Vec<Value> {
     let parsed: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -230,5 +246,19 @@ mod tests {
         assert_eq!(msg["TargetID"], "LCC");
         assert!(msg["Data"]["zones"].is_array());
         assert!(!msg["MessageID"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_diag_level_data_structure() {
+        let data = set_diag_level_data(2);
+        assert_eq!(data["systemControl"]["diagControl"]["level"], 2);
+    }
+
+    #[test]
+    fn set_parameter_data_structure() {
+        let data = set_parameter_data(19, 304, "90");
+        assert_eq!(data["systemControl"]["parameterUpdate"]["et"], 19);
+        assert_eq!(data["systemControl"]["parameterUpdate"]["pid"], 304);
+        assert_eq!(data["systemControl"]["parameterUpdate"]["value"], "90");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Temperature stored as Celsius internally.
@@ -146,6 +147,55 @@ impl Zone {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum Descriptor {
+    Range { min: f64, max: f64, inc: f64, unit: String },
+    Radio { options: BTreeMap<String, String> },
+    String { max_len: Option<u32> },
+}
+
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub pid: u16,
+    pub name: String,
+    pub value: String,
+    pub enabled: bool,
+    pub descriptor: Descriptor,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Equipment {
+    pub id: u16,
+    pub equip_type: u16,
+    pub parameters: BTreeMap<u16, Parameter>,
+}
+
+impl Equipment {
+    pub fn parameter(&self, pid: u16) -> Option<&Parameter> {
+        self.parameters.get(&pid)
+    }
+
+    pub fn high_balance_point(&self) -> Option<f64> {
+        self.parameter(128)?.value.parse().ok()
+    }
+
+    pub fn low_balance_point(&self) -> Option<f64> {
+        self.parameter(129)?.value.parse().ok()
+    }
+
+    pub fn balance_point_enabled(&self) -> Option<bool> {
+        match self.parameter(163)?.value.as_str() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn aux_heat_activation_threshold(&self) -> Option<f64> {
+        self.parameter(176)?.value.parse().ok()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct System {
     pub id: String,
@@ -159,6 +209,11 @@ pub struct System {
     pub manual_away: bool,
     pub smart_away_enabled: bool,
     pub smart_away_setpoint_state: String,
+    pub equipments: Vec<Equipment>,
+    pub single_setpoint_mode: bool,
+    pub diag_level: Option<u8>,
+    pub hp_low_ambient_lockout: bool,
+    pub aux_heat_high_ambient_lockout: bool,
 }
 
 impl System {
@@ -171,6 +226,18 @@ impl System {
         self.manual_away
             || (self.smart_away_enabled
                 && matches!(self.smart_away_setpoint_state.as_str(), "transition" | "away"))
+    }
+
+    pub fn equipment(&self, id: u16) -> Option<&Equipment> {
+        self.equipments.iter().find(|e| e.id == id)
+    }
+
+    pub fn outdoor_unit(&self) -> Option<&Equipment> {
+        self.equipments.iter().find(|e| e.id == 1)
+    }
+
+    pub fn indoor_unit(&self) -> Option<&Equipment> {
+        self.equipments.iter().find(|e| e.id == 2)
     }
 }
 
@@ -200,4 +267,9 @@ pub enum Event {
     EquipmentNumeric { equipment_id: u16, path: String, value: f64 },
     EquipmentString { equipment_id: u16, path: String, value: String },
     EquipmentBool { equipment_id: u16, path: String, value: bool },
+
+    ParameterChanged { equipment_id: u16, pid: u16, name: String, value: String },
+    HpLockoutChanged { locked_out: bool },
+    AuxLockoutChanged { locked_out: bool },
+    AlertChanged { code: u16, active: bool },
 }

@@ -10,6 +10,7 @@ pub enum Error {
     InvalidSetpoints { heat_c: f64, cool_c: f64, deadband_c: f64 },
     Timeout,
     Io(std::io::Error),
+    InvalidParameter { equipment_id: u16, pid: u16, reason: String },
 }
 
 impl fmt::Display for Error {
@@ -26,6 +27,10 @@ impl fmt::Display for Error {
             ),
             Error::Timeout => write!(f, "poll timeout (no data)"),
             Error::Io(e) => write!(f, "IO error: {e}"),
+            Error::InvalidParameter { equipment_id, pid, reason } => write!(
+                f,
+                "invalid parameter: equipment {equipment_id} pid {pid}: {reason}"
+            ),
         }
     }
 }

@@ -553,3 +553,275 @@ async fn set_setpoints_insufficient_gap() {
         "expected InvalidSetpoints, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn poll_parses_equipment_parameters() {
+    let server = MockServer::start().await;
+    let poll_body = serde_json::json!({
+        "messages": [{
+            "SenderID": "LCC",
+            "Data": {
+                "equipments": [{
+                    "id": 1,
+                    "equipment": {
+                        "equipType": 19,
+                        "parameters": [{
+                            "id": 0,
+                            "parameter": {
+                                "pid": 128,
+                                "name": "High Balance Point",
+                                "value": "50",
+                                "enabled": false,
+                                "descriptor": "range",
+                                "range": {"min": "-17", "max": "75", "inc": "1"},
+                                "unit": "F"
+                            }
+                        }, {
+                            "id": 1,
+                            "parameter": {
+                                "pid": 129,
+                                "name": "Low Balance Point",
+                                "value": "25",
+                                "enabled": false,
+                                "descriptor": "range",
+                                "range": {"min": "-20", "max": "72", "inc": "1"},
+                                "unit": "F"
+                            }
+                        }]
+                    }
+                }]
+            }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .mount(&server)
+        .await;
+
+    let mut client = connected_client(&server).await;
+    client.poll().await.unwrap();
+
+    let system = &client.systems()[0];
+    let equip = system.equipment(1).expect("equipment 1 should exist");
+    assert_eq!(equip.equip_type, 19);
+    assert_eq!(equip.high_balance_point(), Some(50.0));
+    assert_eq!(equip.low_balance_point(), Some(25.0));
+    assert!(!equip.parameter(128).unwrap().enabled);
+}
+
+#[tokio::test]
+async fn poll_parses_alerts_and_fires_lockout_events() {
+    let server = MockServer::start().await;
+    let poll_body = serde_json::json!({
+        "messages": [{
+            "SenderID": "LCC",
+            "Data": {
+                "alerts": {
+                    "active": [{
+                        "id": 0,
+                        "alert": {"code": 18, "isStillActive": true}
+                    }, {
+                        "id": 1,
+                        "alert": {"code": 19, "isStillActive": false}
+                    }]
+                }
+            }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .mount(&server)
+        .await;
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
+    let events_clone = events.clone();
+    let addr = server.address();
+    for mock in setup_connect_mocks() {
+        mock.mount(&server).await;
+    }
+    let mut client = S30Client::builder(format!("{}:{}", addr.ip(), addr.port()))
+        .protocol("http")
+        .on_event(move |event| {
+            events_clone.lock().unwrap().push(event.clone());
+        })
+        .build();
+
+    client.connect().await.unwrap();
+    client.poll().await.unwrap();
+
+    let system = &client.systems()[0];
+    assert!(system.hp_low_ambient_lockout);
+    assert!(!system.aux_heat_high_ambient_lockout);
+
+    let captured = events.lock().unwrap();
+    let has_hp = captured
+        .iter()
+        .any(|e| matches!(e, Event::HpLockoutChanged { locked_out: true }));
+    assert!(has_hp, "should fire HpLockoutChanged");
+}
+
+#[tokio::test]
+async fn parameter_change_fires_event() {
+    let server = MockServer::start().await;
+    let poll1 = serde_json::json!({
+        "messages": [{"SenderID": "LCC", "Data": {
+            "equipments": [{"id": 1, "equipment": {
+                "equipType": 19,
+                "parameters": [{"id": 0, "parameter": {
+                    "pid": 304, "name": "HP Lockout Time", "value": "60",
+                    "enabled": true, "descriptor": "range",
+                    "range": {"min": "60", "max": "240", "inc": "30"}, "unit": "min"
+                }}]
+            }}]
+        }}]
+    });
+    let poll2 = serde_json::json!({
+        "messages": [{"SenderID": "LCC", "Data": {
+            "equipments": [{"id": 1, "equipment": {
+                "equipType": 19,
+                "parameters": [{"id": 0, "parameter": {
+                    "pid": 304, "name": "HP Lockout Time", "value": "90",
+                    "enabled": true, "descriptor": "range",
+                    "range": {"min": "60", "max": "240", "inc": "30"}, "unit": "min"
+                }}]
+            }}]
+        }}]
+    });
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll1))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(vec![]));
+    let events_clone = events.clone();
+    let addr = server.address();
+    for mock in setup_connect_mocks() {
+        mock.mount(&server).await;
+    }
+    let mut client = S30Client::builder(format!("{}:{}", addr.ip(), addr.port()))
+        .protocol("http")
+        .on_event(move |event| {
+            events_clone.lock().unwrap().push(event.clone());
+        })
+        .build();
+
+    client.connect().await.unwrap();
+    client.poll().await.unwrap();
+
+    {
+        let captured = events.lock().unwrap();
+        assert!(!captured
+            .iter()
+            .any(|e| matches!(e, Event::ParameterChanged { .. })));
+    }
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll2))
+        .mount(&server)
+        .await;
+
+    events.lock().unwrap().clear();
+    client.poll().await.unwrap();
+
+    let captured = events.lock().unwrap();
+    let has_change = captured.iter().any(|e| {
+        matches!(
+            e,
+            Event::ParameterChanged {
+                equipment_id: 1,
+                pid: 304,
+                ..
+            }
+        )
+    });
+    assert!(has_change, "should fire ParameterChanged for pid 304");
+}
+
+#[tokio::test]
+async fn set_equipment_parameter_validates_and_sends() {
+    let server = MockServer::start().await;
+
+    let poll_body = serde_json::json!({
+        "messages": [{"SenderID": "LCC", "Data": {
+            "equipments": [{"id": 1, "equipment": {
+                "equipType": 19,
+                "parameters": [{"id": 0, "parameter": {
+                    "pid": 304, "name": "HP Lockout Time", "value": "60",
+                    "enabled": true, "descriptor": "range",
+                    "range": {"min": "60", "max": "240", "inc": "30"}, "unit": "min"
+                }}]
+            }}]
+        }}]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/Messages/Publish"))
+        .and(body_string_contains("parameterUpdate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut client = connected_client(&server).await;
+    client.poll().await.unwrap();
+
+    client
+        .set_equipment_parameter(1, 304, "90")
+        .await
+        .expect("valid write should succeed");
+
+    let err = client
+        .set_equipment_parameter(1, 304, "300")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, lennox_s30::Error::InvalidParameter { .. }));
+
+    let err = client
+        .set_equipment_parameter(1, 304, "65")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, lennox_s30::Error::InvalidParameter { .. }));
+}
+
+#[tokio::test]
+async fn set_equipment_parameter_rejects_disabled() {
+    let server = MockServer::start().await;
+    let poll_body = serde_json::json!({
+        "messages": [{"SenderID": "LCC", "Data": {
+            "equipments": [{"id": 1, "equipment": {
+                "equipType": 19,
+                "parameters": [{"id": 0, "parameter": {
+                    "pid": 128, "name": "High Balance Point", "value": "50",
+                    "enabled": false, "descriptor": "range",
+                    "range": {"min": "-17", "max": "75", "inc": "1"}, "unit": "F"
+                }}]
+            }}]
+        }}]
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/Messages/.+/Retrieve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_body))
+        .mount(&server)
+        .await;
+
+    let mut client = connected_client(&server).await;
+    client.poll().await.unwrap();
+
+    let err = client
+        .set_equipment_parameter(1, 128, "45")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, lennox_s30::Error::InvalidParameter { .. }));
+}

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde_json::{Map, Value};
 use tracing::{debug, trace};
 
@@ -15,6 +17,59 @@ const DEADBAND_C: f64 = 1.5;
 type EventCallback = Box<dyn Fn(&Event) + Send + Sync>;
 type SnapshotCallback = Box<dyn Fn(&System) + Send + Sync>;
 
+const DIAG_COOLDOWN_SECS: u64 = 300;
+const DIAG_MAX_ATTEMPTS_PER_HOUR: u8 = 3;
+
+struct DiagEnforcer {
+    target_level: u8,
+    last_sent: Option<Instant>,
+    attempts_this_hour: u8,
+    hour_start: Instant,
+}
+
+impl DiagEnforcer {
+    fn new(level: u8) -> Self {
+        Self {
+            target_level: level,
+            last_sent: None,
+            attempts_this_hour: 0,
+            hour_start: Instant::now(),
+        }
+    }
+
+    fn should_send(&mut self) -> bool {
+        let now = Instant::now();
+
+        if now.duration_since(self.hour_start).as_secs() >= 3600 {
+            self.attempts_this_hour = 0;
+            self.hour_start = now;
+        }
+
+        if self.attempts_this_hour >= DIAG_MAX_ATTEMPTS_PER_HOUR {
+            return false;
+        }
+
+        if let Some(last) = self.last_sent
+            && now.duration_since(last).as_secs() < DIAG_COOLDOWN_SECS
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn record_sent(&mut self) {
+        self.last_sent = Some(Instant::now());
+        self.attempts_this_hour += 1;
+    }
+
+    fn reset(&mut self) {
+        self.last_sent = None;
+        self.attempts_this_hour = 0;
+        self.hour_start = Instant::now();
+    }
+}
+
 pub struct S30ClientBuilder {
     ip: String,
     protocol: String,
@@ -23,6 +78,7 @@ pub struct S30ClientBuilder {
     snapshot_callbacks: Vec<SnapshotCallback>,
     log_mode: Option<MessageLogMode>,
     log_path: Option<String>,
+    diag_level: Option<u8>,
 }
 
 impl S30ClientBuilder {
@@ -35,6 +91,7 @@ impl S30ClientBuilder {
             snapshot_callbacks: Vec::new(),
             log_mode: None,
             log_path: None,
+            diag_level: None,
         }
     }
 
@@ -64,6 +121,11 @@ impl S30ClientBuilder {
         self
     }
 
+    pub fn diag_level(mut self, level: u8) -> Self {
+        self.diag_level = Some(level);
+        self
+    }
+
     pub fn build(self) -> S30Client {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -87,6 +149,8 @@ impl S30ClientBuilder {
             event_callbacks: self.event_callbacks,
             snapshot_callbacks: self.snapshot_callbacks,
             logger,
+            diag_enforcer: self.diag_level.map(DiagEnforcer::new),
+            diag_reassert_needed: false,
         }
     }
 }
@@ -101,6 +165,8 @@ pub struct S30Client {
     event_callbacks: Vec<EventCallback>,
     snapshot_callbacks: Vec<SnapshotCallback>,
     logger: Option<MessageLogger>,
+    diag_enforcer: Option<DiagEnforcer>,
+    diag_reassert_needed: bool,
 }
 
 impl S30Client {
@@ -137,6 +203,18 @@ impl S30Client {
             .send()
             .await?
             .error_for_status()?;
+
+        if let Some(ref mut enforcer) = self.diag_enforcer {
+            let data = crate::protocol::set_diag_level_data(enforcer.target_level);
+            let msg = crate::protocol::command_message(&self.app_id, data.clone());
+            let url = format!("{}/Messages/Publish", self.base_url);
+            if let Some(ref mut logger) = self.logger {
+                logger.log_command("set_diag_level", None, &data);
+            }
+            self.http.post(&url).json(&msg).send().await?.error_for_status()?;
+            enforcer.reset();
+            enforcer.record_sent();
+        }
 
         self.connected = true;
         Ok(())
@@ -187,6 +265,21 @@ impl S30Client {
 
         for data in &data_payloads {
             self.process_data(data);
+        }
+
+        if self.diag_reassert_needed {
+            self.diag_reassert_needed = false;
+            let target = self.diag_enforcer.as_ref().map(|e| e.target_level);
+            if let Some(level) = target {
+                let data = crate::protocol::set_diag_level_data(level);
+                self.publish_command_logged("reassert_diag_level", None, data).await?;
+                if let Some(ref mut enforcer) = self.diag_enforcer {
+                    enforcer.record_sent();
+                    if enforcer.attempts_this_hour >= DIAG_MAX_ATTEMPTS_PER_HOUR {
+                        debug!("diagLevel circuit breaker tripped, stopping reassertions for this hour");
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -381,6 +474,10 @@ impl S30Client {
                     }
                 }
 
+                let sys_idx = self.ensure_system("0");
+                self.update_equipment_from_json(sys_idx, equip_id, equip_data, &mut all_events);
+                snapshot_system_indices.insert(sys_idx);
+
                 let equip_map = self
                     .previous_json
                     .as_object_mut()
@@ -390,6 +487,66 @@ impl S30Client {
                 if let Value::Object(m) = equip_map {
                     m.insert(equip_id.to_string(), equip_data.clone());
                 }
+            }
+        }
+
+        if let Some(alerts_data) = data.get("alerts")
+            && let Some(Value::Array(active)) = alerts_data.get("active")
+        {
+            let sys_idx = self.ensure_system("0");
+            let system = &mut self.systems[sys_idx];
+
+            let prev_hp_lockout = system.hp_low_ambient_lockout;
+            let prev_aux_lockout = system.aux_heat_high_ambient_lockout;
+
+            let mut hp_lockout = false;
+            let mut aux_lockout = false;
+
+            for alert_entry in active {
+                let alert = match alert_entry.get("alert") {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let code = match alert.get("code").and_then(|v| v.as_u64()) {
+                    Some(c) => c as u16,
+                    None => continue,
+                };
+                let is_active = alert.get("isStillActive").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                match code {
+                    18 => hp_lockout = is_active,
+                    19 => aux_lockout = is_active,
+                    _ => {}
+                }
+
+                all_events.push(Event::AlertChanged { code, active: is_active });
+            }
+
+            system.hp_low_ambient_lockout = hp_lockout;
+            system.aux_heat_high_ambient_lockout = aux_lockout;
+
+            if hp_lockout != prev_hp_lockout {
+                all_events.push(Event::HpLockoutChanged { locked_out: hp_lockout });
+            }
+            if aux_lockout != prev_aux_lockout {
+                all_events.push(Event::AuxLockoutChanged { locked_out: aux_lockout });
+            }
+
+            snapshot_system_indices.insert(sys_idx);
+        }
+
+        if let Some(ref mut enforcer) = self.diag_enforcer {
+            let current_level = self.systems.first().and_then(|s| s.diag_level);
+            if let Some(level) = current_level
+                && level < enforcer.target_level
+                && enforcer.should_send()
+            {
+                debug!(
+                    current = level,
+                    target = enforcer.target_level,
+                    "diagLevel dropped, reasserting"
+                );
+                self.diag_reassert_needed = true;
             }
         }
 
@@ -473,6 +630,13 @@ impl S30Client {
         {
             system.outdoor_temperature = Some(Temperature::from_fahrenheit(f));
         }
+
+        if let Some(ssp) = status.get("singleSetpointMode").and_then(|v| v.as_bool()) {
+            system.single_setpoint_mode = ssp;
+        }
+        if let Some(dl) = status.get("diagLevel").and_then(|v| v.as_u64()) {
+            system.diag_level = Some(dl as u8);
+        }
     }
 
     fn update_zone_from_json(&mut self, sys_idx: usize, zone_id: u8, data: &Value) {
@@ -555,6 +719,66 @@ impl S30Client {
             let hold_sched = hold.get("scheduleId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let enabled = hold.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             zone.override_active = hold_sched == override_schedule_id(zone_id) && enabled;
+        }
+    }
+
+    fn update_equipment_from_json(
+        &mut self,
+        sys_idx: usize,
+        equip_id: u16,
+        data: &Value,
+        events: &mut Vec<Event>,
+    ) {
+        let system = &mut self.systems[sys_idx];
+        let equipment = match system.equipments.iter_mut().find(|e| e.id == equip_id) {
+            Some(e) => e,
+            None => {
+                system.equipments.push(Equipment {
+                    id: equip_id,
+                    ..Default::default()
+                });
+                system.equipments.last_mut().unwrap()
+            }
+        };
+
+        if let Some(et) = data.pointer("/equipment/equipType").and_then(|v| v.as_u64()) {
+            equipment.equip_type = et as u16;
+        }
+
+        if let Some(Value::Array(params)) = data.pointer("/equipment/parameters") {
+            for param_entry in params {
+                let param_data = match param_entry.get("parameter") {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let pid = match param_data.get("pid").and_then(|v| v.as_u64()) {
+                    Some(p) => p as u16,
+                    None => continue,
+                };
+                let name = param_data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let value = param_data.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let enabled = param_data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                let descriptor = parse_descriptor(param_data);
+
+                let prev_value = equipment.parameters.get(&pid).map(|p| p.value.clone());
+
+                equipment.parameters.insert(pid, Parameter {
+                    pid,
+                    name: name.clone(),
+                    value: value.clone(),
+                    enabled,
+                    descriptor,
+                });
+
+                if prev_value.as_deref() != Some(&value) && prev_value.is_some() {
+                    events.push(Event::ParameterChanged {
+                        equipment_id: equip_id,
+                        pid,
+                        name,
+                        value,
+                    });
+                }
+            }
         }
     }
 
@@ -682,6 +906,47 @@ impl S30Client {
             .await
     }
 
+    /// Set an equipment parameter value. Validates against descriptor before sending.
+    pub async fn set_equipment_parameter(
+        &mut self,
+        equipment_id: u16,
+        pid: u16,
+        value: &str,
+    ) -> Result<()> {
+        let equipment = self.systems.iter()
+            .flat_map(|s| &s.equipments)
+            .find(|e| e.id == equipment_id)
+            .ok_or_else(|| Error::InvalidParameter {
+                equipment_id,
+                pid,
+                reason: "equipment not found".to_string(),
+            })?;
+
+        let equip_type = equipment.equip_type;
+
+        let param = equipment.parameters.get(&pid)
+            .ok_or_else(|| Error::InvalidParameter {
+                equipment_id,
+                pid,
+                reason: "parameter not found".to_string(),
+            })?;
+
+        if !param.enabled {
+            return Err(Error::InvalidParameter {
+                equipment_id,
+                pid,
+                reason: "parameter is read-only (enabled=false)".to_string(),
+            });
+        }
+
+        let validated = validate_parameter(param, value).map_err(|reason| {
+            Error::InvalidParameter { equipment_id, pid, reason }
+        })?;
+
+        let data = crate::protocol::set_parameter_data(equip_type, pid, &validated);
+        self.publish_command_logged("set_parameter", None, data).await
+    }
+
     // -- Helpers --
 
     fn find_zone(&self, zone_id: u8) -> Result<&Zone> {
@@ -750,6 +1015,74 @@ fn merge_json(target: &mut Map<String, Value>, key: &str, new_data: &Value) {
         .entry(key.to_string())
         .or_insert(Value::Null);
     deep_merge(entry, new_data);
+}
+
+fn validate_parameter(param: &Parameter, value: &str) -> std::result::Result<String, String> {
+    match &param.descriptor {
+        Descriptor::Range { min, max, inc, .. } => {
+            let v: f64 = value.parse().map_err(|_| format!("not a number: {value}"))?;
+            if v < *min || v > *max {
+                return Err(format!("out of range: {v} not in {min}..{max}"));
+            }
+            if *inc > 0.0 {
+                let steps = ((v - min) / inc).round();
+                let reconstructed = min + steps * inc;
+                if (reconstructed - v).abs() > 1e-9 {
+                    return Err(format!("{v} not a multiple of {inc} (from {min})"));
+                }
+            }
+            Ok(value.to_string())
+        }
+        Descriptor::Radio { options } => {
+            if options.contains_key(value) {
+                return Ok(value.to_string());
+            }
+            for (id, label) in options {
+                if label == value {
+                    return Ok(id.clone());
+                }
+            }
+            let valid: Vec<_> = options.values().collect();
+            Err(format!("unknown option: {value} (valid: {valid:?})"))
+        }
+        Descriptor::String { max_len } => {
+            if let Some(max) = max_len
+                && value.len() > *max as usize
+            {
+                return Err(format!("too long: {} > {max}", value.len()));
+            }
+            Ok(value.to_string())
+        }
+    }
+}
+
+fn parse_descriptor(param_data: &Value) -> Descriptor {
+    match param_data.get("descriptor").and_then(|v| v.as_str()) {
+        Some("range") => {
+            let range = param_data.pointer("/range").unwrap_or(&Value::Null);
+            Descriptor::Range {
+                min: range.get("min").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                max: range.get("max").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                inc: range.get("inc").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1.0),
+                unit: param_data.get("unit").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }
+        }
+        Some("radio") => {
+            let mut options = std::collections::BTreeMap::new();
+            if let Some(Value::Object(map)) = param_data.get("radio") {
+                for (id, label) in map {
+                    if let Some(text) = label.as_str() {
+                        options.insert(id.clone(), text.to_string());
+                    }
+                }
+            }
+            Descriptor::Radio { options }
+        }
+        _ => {
+            let max_len = param_data.get("string_max").and_then(|v| v.as_u64()).map(|v| v as u32);
+            Descriptor::String { max_len }
+        }
+    }
 }
 
 #[cfg(test)]
